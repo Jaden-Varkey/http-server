@@ -75,7 +75,7 @@ struct Conn {
     uint32_t events = EPOLLIN;
     off_t file_off = 0, file_left = 0;
     size_t index = 0;
-    size_t in_len = 0, out_off = 0, out_len = 0;
+    size_t in_len = 0, in_used = 0, out_off = 0, out_len = 0;
     time_t deadline = 0;
     std::array<char, kInSize> in;
     std::array<char, kOutSize> out;
@@ -123,6 +123,13 @@ void on_signal(int)
     ssize_t r = write(g_stop_fd, &one, sizeof one);
     (void)r;
     errno = saved;
+}
+
+time_t now()
+{
+    timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return ts.tv_sec;
 }
 
 const char* reason(int status)
@@ -178,6 +185,7 @@ public:
     Worker(Fd listener, const Shared& shared) : listener_(std::move(listener)), shared_(shared) {}
 
     void run();
+    const Stats& stats() const { return stats_; }
 
 private:
     void accept_all();
@@ -186,8 +194,10 @@ private:
     void serve(Conn& c, const Request& req);
     void respond_error(Conn& c, int status, bool body = true);
     bool write_out(Conn& c);
+    void finish(Conn& c);
     void watch(Conn& c, uint32_t events);
     void close_conn(Conn& c);
+    void sweep();
     const char* date();
 
     Fd listener_;
@@ -195,6 +205,8 @@ private:
     Fd epoll_;
     std::vector<std::unique_ptr<Conn>> conns_;
     std::vector<size_t> free_;
+    Stats stats_;
+    time_t last_sweep_ = 0;
     time_t date_time_ = 0;
     char date_[64] = {};
 };
@@ -211,7 +223,7 @@ void Worker::run()
 
     std::array<epoll_event, 256> events;
     for (;;) {
-        int n = epoll_wait(epoll_.get(), events.data(), events.size(), -1);
+        int n = epoll_wait(epoll_.get(), events.data(), events.size(), 1000);
         if (n < 0 && errno != EINTR) {
             std::perror("epoll_wait");
             return;
@@ -228,11 +240,14 @@ void Worker::run()
             Conn* c = conns_[tag - kFirstConnTag].get();
             if (!c)
                 continue;
-            if (c->writing)
-                write_out(*c);
-            else
+            if (c->writing) {
+                if (write_out(*c) && !c->writing)
+                    process(*c);
+            } else {
                 on_readable(*c);
+            }
         }
+        sweep();
     }
 }
 
@@ -263,6 +278,7 @@ void Worker::accept_all()
         auto c = std::make_unique<Conn>();
         c->fd = Fd(fd);
         c->index = idx;
+        c->deadline = now() + shared_.timeout;
 
         epoll_event ev{};
         ev.events = EPOLLIN;
@@ -272,6 +288,7 @@ void Worker::accept_all()
             continue;
         }
         conns_[idx] = std::move(c);
+        stats_.accepted++;
     }
 }
 
@@ -290,22 +307,29 @@ void Worker::on_readable(Conn& c)
         close_conn(c);
         return;
     }
+    c.deadline = now() + shared_.timeout;
     process(c);
 }
 
+// Answers buffered requests until one has to wait for the socket or more input is needed.
 void Worker::process(Conn& c)
 {
-    ParseResult r = parse_request({c.in.data(), c.in_len});
-    if (r.kind == ParseResult::Kind::Incomplete) {
-        if (c.in_len < c.in.size())
+    while (!c.writing) {
+        ParseResult r = parse_request({c.in.data(), c.in_len});
+        if (r.kind == ParseResult::Kind::Incomplete) {
+            if (c.in_len < c.in.size())
+                return;
+            respond_error(c, 431);
+        } else if (r.kind == ParseResult::Kind::Error) {
+            respond_error(c, r.status);
+        } else {
+            c.in_used = r.used;
+            stats_.requests++;
+            serve(c, r.request);
+        }
+        if (!write_out(c))
             return;
-        respond_error(c, 431);
-    } else if (r.kind == ParseResult::Kind::Error) {
-        respond_error(c, r.status);
-    } else {
-        serve(c, r.request);
     }
-    write_out(c);
 }
 
 void Worker::serve(Conn& c, const Request& req)
@@ -323,14 +347,16 @@ void Worker::serve(Conn& c, const Request& req)
     if (fstat(file.get(), &st) < 0 || !S_ISREG(st.st_mode))
         return respond_error(c, 404, !head);
 
+    c.close_after = !req.keep_alive;
     int len = std::snprintf(c.out.data(), c.out.size(),
                             "HTTP/1.1 200 OK\r\n"
                             "Server: http-server\r\n"
                             "Date: %s\r\n"
                             "Content-Type: %s\r\n"
                             "Content-Length: %lld\r\n"
-                            "Connection: close\r\n\r\n",
-                            date(), content_type(*path), static_cast<long long>(st.st_size));
+                            "Connection: %s\r\n\r\n",
+                            date(), content_type(*path), static_cast<long long>(st.st_size),
+                            c.close_after ? "close" : "keep-alive");
     if (len < 0 || static_cast<size_t>(len) >= c.out.size())
         return respond_error(c, 500, !head);
 
@@ -381,6 +407,7 @@ bool Worker::write_out(Conn& c)
                 c.out_off += n;
             else
                 c.file_left -= n;
+            c.deadline = now() + shared_.timeout;
             continue;
         }
         if (n < 0 && errno == EINTR)
@@ -393,8 +420,23 @@ bool Worker::write_out(Conn& c)
         return false;
     }
 
-    close_conn(c);
-    return false;
+    if (c.close_after) {
+        close_conn(c);
+        return false;
+    }
+    finish(c);
+    return true;
+}
+
+void Worker::finish(Conn& c)
+{
+    c.file.reset();
+    std::memmove(c.in.data(), c.in.data() + c.in_used, c.in_len - c.in_used);
+    c.in_len -= c.in_used;
+    c.in_used = 0;
+    c.out_off = c.out_len = 0;
+    c.writing = false;
+    watch(c, EPOLLIN);
 }
 
 void Worker::watch(Conn& c, uint32_t events)
@@ -413,6 +455,20 @@ void Worker::close_conn(Conn& c)
     size_t idx = c.index;
     conns_[idx].reset();
     free_.push_back(idx);
+}
+
+void Worker::sweep()
+{
+    time_t t = now();
+    if (t == last_sweep_)
+        return;
+    last_sweep_ = t;
+    for (auto& c : conns_) {
+        if (c && c->deadline <= t) {
+            stats_.timeouts++;
+            close_conn(*c);
+        }
+    }
 }
 
 const char* Worker::date()
@@ -474,6 +530,14 @@ int run_server(const Config& cfg)
         threads.emplace_back(&Worker::run, w.get());
     for (auto& t : threads)
         t.join();
+
+    Stats total;
+    for (auto& w : workers) {
+        total.accepted += w->stats().accepted;
+        total.requests += w->stats().requests;
+        total.timeouts += w->stats().timeouts;
+    }
+    std::printf("\naccepted %lu, requests %lu, timeouts %lu\n", total.accepted, total.requests, total.timeouts);
     return 0;
 }
 
