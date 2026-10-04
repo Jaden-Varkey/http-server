@@ -3,7 +3,7 @@ CXXFLAGS ?= -O2
 CXXFLAGS += -std=c++20 -Wall -Wextra -Isrc
 LDFLAGS  += -pthread
 
-SRC = src/main.cpp src/server.cpp
+SRC = src/main.cpp src/server.cpp src/parse.cpp
 
 http-server: $(SRC) src/server.hpp src/parse.hpp
 	$(CXX) $(CXXFLAGS) -o $@ $(SRC) $(LDFLAGS)
