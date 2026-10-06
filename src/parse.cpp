@@ -1,212 +1,160 @@
 #include "parse.hpp"
 
-#include <vector>
+#include <algorithm>
+#include <cctype>
 
 namespace http {
 namespace {
 
-bool iequals(std::string_view a, std::string_view b)
+using Kind = ParseResult::Kind;
+
+ParseResult reject(int status)
 {
-    if (a.size() != b.size())
-        return false;
-    for (size_t i = 0; i < a.size(); i++) {
-        char x = a[i], y = b[i];
-        if (x >= 'A' && x <= 'Z')
-            x += 'a' - 'A';
-        if (y >= 'A' && y <= 'Z')
-            y += 'a' - 'A';
-        if (x != y)
-            return false;
-    }
-    return true;
+    ParseResult r;
+    r.kind = Kind::Error;
+    r.status = status;
+    return r;
+}
+
+bool is_ows(char c)
+{
+    return c == ' ' || c == '\t';
 }
 
 std::string_view trim(std::string_view s)
 {
-    while (!s.empty() && (s.front() == ' ' || s.front() == '\t'))
+    while (!s.empty() && is_ows(s.front()))
         s.remove_prefix(1);
-    while (!s.empty() && (s.back() == ' ' || s.back() == '\t'))
+    while (!s.empty() && is_ows(s.back()))
         s.remove_suffix(1);
     return s;
 }
 
-bool is_tchar(char c)
+bool iequals(std::string_view a, std::string_view b)
 {
-    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9'))
-        return true;
-    return std::string_view("!#$%&'*+-.^_`|~").find(c) != std::string_view::npos;
+    return std::ranges::equal(a, b, [](unsigned char x, unsigned char y) {
+        return std::tolower(x) == std::tolower(y);
+    });
 }
 
-bool is_token(std::string_view s)
+// True if the comma-separated list contains tok.
+bool has_token(std::string_view list, std::string_view tok)
 {
-    if (s.empty())
-        return false;
-    for (char c : s)
-        if (!is_tchar(c))
-            return false;
-    return true;
-}
-
-int hex_value(char c)
-{
-    if (c >= '0' && c <= '9')
-        return c - '0';
-    if (c >= 'a' && c <= 'f')
-        return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F')
-        return c - 'A' + 10;
-    return -1;
-}
-
-// Connection is a comma separated list, e.g. "keep-alive, Upgrade".
-void apply_connection(std::string_view value, Request& req)
-{
-    while (!value.empty()) {
-        size_t comma = value.find(',');
-        std::string_view opt = trim(value.substr(0, comma));
-        if (iequals(opt, "close"))
-            req.keep_alive = false;
-        else if (iequals(opt, "keep-alive"))
-            req.keep_alive = true;
+    while (!list.empty()) {
+        size_t comma = list.find(',');
+        if (iequals(trim(list.substr(0, comma)), tok))
+            return true;
         if (comma == std::string_view::npos)
             break;
-        value.remove_prefix(comma + 1);
+        list.remove_prefix(comma + 1);
     }
+    return false;
 }
 
-ParseResult fail(int status)
+bool has_bare_newline(std::string_view line)
 {
-    ParseResult r;
-    r.kind = ParseResult::Kind::Error;
-    r.status = status;
-    return r;
+    return line.find_first_of("\r\n") != std::string_view::npos;
+}
+
+int hex(char c)
+{
+    return std::isdigit(static_cast<unsigned char>(c)) ? c - '0' : (c | 0x20) - 'a' + 10;
 }
 
 }  // namespace
 
 ParseResult parse_request(std::string_view buf)
 {
+    constexpr auto npos = std::string_view::npos;
     size_t end = buf.find("\r\n\r\n");
-    if (end == std::string_view::npos)
+    if (end == npos)
         return {};
 
-    ParseResult r;
-    r.used = end + 4;
-    std::string_view head = buf.substr(0, end + 2);
-
+    std::string_view head = buf.substr(0, end);
     size_t eol = head.find("\r\n");
     std::string_view line = head.substr(0, eol);
-    head.remove_prefix(eol + 2);
+    std::string_view headers = eol == npos ? std::string_view{} : head.substr(eol + 2);
 
     size_t sp1 = line.find(' ');
-    size_t sp2 = sp1 == std::string_view::npos ? sp1 : line.find(' ', sp1 + 1);
-    if (sp2 == std::string_view::npos || line.find(' ', sp2 + 1) != std::string_view::npos)
-        return fail(400);
+    size_t sp2 = sp1 == npos ? npos : line.find(' ', sp1 + 1);
+    if (sp1 == 0 || sp2 == npos || has_bare_newline(line))
+        return reject(400);
 
     std::string_view method = line.substr(0, sp1);
     std::string_view target = line.substr(sp1 + 1, sp2 - sp1 - 1);
     std::string_view version = line.substr(sp2 + 1);
 
-    if (version.size() != 8 || version.substr(0, 5) != "HTTP/" || version[6] != '.')
-        return fail(400);
-    if (version[5] != '1')
-        return fail(505);
-    bool http11 = version[7] != '0';
-    r.request.keep_alive = http11;
+    auto is_ctl = [](unsigned char c) { return c <= 0x20 || c == 0x7f; };
+    if (target.empty() || target[0] != '/' || std::ranges::any_of(target, is_ctl))
+        return reject(400);
+    if (version.size() != 8 || !version.starts_with("HTTP/"))
+        return reject(400);
+    if (!version.starts_with("HTTP/1.") || (version[7] != '0' && version[7] != '1'))
+        return reject(505);
 
-    if (!is_token(method))
-        return fail(400);
+    ParseResult result;
+    result.kind = Kind::Ok;
+    result.used = end + 4;
+    result.request.target = target;
+    result.request.keep_alive = version[7] == '1';
     if (method == "GET")
-        r.request.method = Method::Get;
+        result.request.method = Method::Get;
     else if (method == "HEAD")
-        r.request.method = Method::Head;
+        result.request.method = Method::Head;
     else
-        return fail(501);
+        return reject(405);
 
-    if (target.empty() || target[0] != '/')
-        return fail(400);
-    r.request.target = target;
+    while (!headers.empty()) {
+        size_t next = headers.find("\r\n");
+        std::string_view h = headers.substr(0, next);
+        headers = next == npos ? std::string_view{} : headers.substr(next + 2);
 
-    bool has_host = false;
-    while (!head.empty()) {
-        eol = head.find("\r\n");
-        line = head.substr(0, eol);
-        head.remove_prefix(eol + 2);
+        size_t colon = h.find(':');
+        if (colon == 0 || colon == npos || is_ows(h[0]) || has_bare_newline(h))
+            return reject(400);
 
-        size_t colon = line.find(':');
-        if (colon == std::string_view::npos || !is_token(line.substr(0, colon)))
-            return fail(400);
-        std::string_view name = line.substr(0, colon);
-        std::string_view value = trim(line.substr(colon + 1));
-
-        if (iequals(name, "Host")) {
-            if (has_host)
-                return fail(400);
-            has_host = true;
-        } else if (iequals(name, "Connection")) {
-            apply_connection(value, r.request);
-        } else if (iequals(name, "Transfer-Encoding")) {
-            return fail(501);
-        } else if (iequals(name, "Content-Length")) {
-            if (value != "0")
-                return fail(413);
+        std::string_view name = h.substr(0, colon);
+        std::string_view value = trim(h.substr(colon + 1));
+        if (iequals(name, "connection")) {
+            if (has_token(value, "close"))
+                result.request.keep_alive = false;
+            else if (has_token(value, "keep-alive"))
+                result.request.keep_alive = true;
+        } else if (iequals(name, "content-length")) {
+            if (value.empty() || !std::ranges::all_of(value, [](char c) { return c == '0'; }))
+                return reject(400);
+        } else if (iequals(name, "transfer-encoding")) {
+            return reject(501);
         }
     }
-
-    if (http11 && !has_host)
-        return fail(400);
-
-    r.kind = ParseResult::Kind::Ok;
-    return r;
+    return result;
 }
 
 std::optional<std::string> target_to_path(std::string_view target)
 {
-    target = target.substr(0, target.find_first_of("?#"));
-
-    std::string decoded;
-    decoded.reserve(target.size());
-    for (size_t i = 0; i < target.size(); i++) {
-        char c = target[i];
-        if (c == '%') {
-            if (i + 2 >= target.size())
-                return std::nullopt;
-            int hi = hex_value(target[i + 1]), lo = hex_value(target[i + 2]);
-            if (hi < 0 || lo < 0)
-                return std::nullopt;
-            c = static_cast<char>(hi * 16 + lo);
-            i += 2;
-        }
-        if (c == '\0')
-            return std::nullopt;
-        decoded += c;
-    }
-
-    std::vector<std::string_view> parts;
-    std::string_view rest = decoded;
-    while (!rest.empty()) {
-        size_t slash = rest.find('/');
-        std::string_view seg = rest.substr(0, slash);
-        if (seg == "..") {
-            if (parts.empty())
-                return std::nullopt;
-            parts.pop_back();
-        } else if (!seg.empty() && seg != ".") {
-            parts.push_back(seg);
-        }
-        if (slash == std::string_view::npos)
-            break;
-        rest.remove_prefix(slash + 1);
-    }
-
+    constexpr size_t max_path = 1024;
     std::string path;
-    for (std::string_view seg : parts) {
-        if (!path.empty())
-            path += '/';
-        path += seg;
+    size_t i = target.find_first_not_of('/');
+    for (; i < target.size(); i++) {
+        char c = target[i];
+        if (c == '?' || c == '#')
+            break;
+        if (c == '%') {
+            if (i + 2 >= target.size() ||
+                !std::isxdigit(static_cast<unsigned char>(target[i + 1])) ||
+                !std::isxdigit(static_cast<unsigned char>(target[i + 2])))
+                return std::nullopt;
+            c = static_cast<char>(hex(target[i + 1]) * 16 + hex(target[i + 2]));
+            i += 2;
+            if (c == '\0')
+                return std::nullopt;
+        }
+        path.push_back(c);
+        if (path.size() >= max_path)
+            return std::nullopt;
     }
-    if (decoded.back() == '/' || path.empty())
-        path += path.empty() ? "index.html" : "/index.html";
+    if (path.empty() || path.back() == '/')
+        path += "index.html";
     return path;
 }
 

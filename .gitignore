@@ -1,2 +1,4 @@
 http-server
+tests/test_parse
 *.o
+__pycache__/
