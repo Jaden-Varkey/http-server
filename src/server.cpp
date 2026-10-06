@@ -1,10 +1,9 @@
 #include "server.hpp"
 #include "parse.hpp"
+#include "sys.h"
 
 #include <array>
 #include <cerrno>
-#include <csignal>
-#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <ctime>
@@ -13,18 +12,13 @@
 #include <utility>
 #include <vector>
 
-#include <arpa/inet.h>
 #include <fcntl.h>
-#include <linux/openat2.h>
+#include <netinet/in.h>
 #include <netinet/tcp.h>
-#include <strings.h>
 #include <sys/epoll.h>
-#include <sys/eventfd.h>
-#include <sys/resource.h>
 #include <sys/sendfile.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
-#include <sys/syscall.h>
 #include <unistd.h>
 
 namespace http {
@@ -34,7 +28,7 @@ constexpr size_t kInSize = 8192;
 constexpr size_t kOutSize = 8192;
 constexpr int kMaxEvents = 256;
 
-int g_stop_fd = -1;  // written by the signal handler to wake every worker
+int g_stop_fd = -1;  // becomes readable on SIGINT/SIGTERM and wakes every worker
 
 // Owns a file descriptor and closes it exactly once.
 class Fd {
@@ -87,54 +81,6 @@ struct Stats {
     unsigned long accepted = 0, requests = 0, timeouts = 0;
 };
 
-time_t clock_sec()
-{
-    timespec ts;
-    clock_gettime(CLOCK_MONOTONIC_COARSE, &ts);
-    return ts.tv_sec;
-}
-
-// Opens path relative to root; the kernel refuses any escape from it.
-int open_beneath(int root, const char* path)
-{
-    open_how how{};
-    how.flags = O_RDONLY | O_CLOEXEC | O_NONBLOCK;
-    how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
-    return static_cast<int>(syscall(SYS_openat2, root, path, &how, sizeof how));
-}
-
-const char* mime_type(const std::string& path)
-{
-    static constexpr struct {
-        const char *ext, *type;
-    } table[] = {
-        {".html", "text/html; charset=utf-8"}, {".css", "text/css"},
-        {".js", "text/javascript"},            {".json", "application/json"},
-        {".txt", "text/plain; charset=utf-8"}, {".png", "image/png"},
-        {".jpg", "image/jpeg"},                {".gif", "image/gif"},
-        {".svg", "image/svg+xml"},             {".ico", "image/x-icon"},
-    };
-    const char* dot = std::strrchr(path.c_str(), '.');
-    if (dot)
-        for (auto& [ext, type] : table)
-            if (strcasecmp(dot, ext) == 0)
-                return type;
-    return "application/octet-stream";
-}
-
-const char* status_text(int status)
-{
-    switch (status) {
-    case 400: return "Bad Request";
-    case 404: return "Not Found";
-    case 405: return "Method Not Allowed";
-    case 431: return "Request Header Fields Too Large";
-    case 501: return "Not Implemented";
-    case 505: return "HTTP Version Not Supported";
-    default:  return "Internal Server Error";
-    }
-}
-
 // req is null when the request could not be parsed; the connection then closes.
 void reply_error(Conn& c, int status, const Request* req)
 {
@@ -172,7 +118,7 @@ void respond(Conn& c, const Request& req, int root)
     c.out_len = std::snprintf(c.out.data(), kOutSize,
                               "HTTP/1.1 200 OK\r\nContent-Type: %s\r\n"
                               "Content-Length: %lld\r\nConnection: %s\r\n\r\n",
-                              mime_type(*path), static_cast<long long>(st.st_size),
+                              mime_type(path->c_str()), static_cast<long long>(st.st_size),
                               req.keep_alive ? "keep-alive" : "close");
 
     if (req.method == Method::Head)
@@ -373,43 +319,11 @@ private:
     std::jthread thread_;
 };
 
-Fd listen_on(const std::string& addr, int port)
-{
-    int one = 1;
-    Fd fd(socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK | SOCK_CLOEXEC, 0));
-    sockaddr_in sa{};
-    sa.sin_family = AF_INET;
-    sa.sin_port = htons(port);
-
-    if (fd && inet_pton(AF_INET, addr.c_str(), &sa.sin_addr) == 1 &&
-        setsockopt(fd.get(), SOL_SOCKET, SO_REUSEADDR, &one, sizeof one) == 0 &&
-        setsockopt(fd.get(), SOL_SOCKET, SO_REUSEPORT, &one, sizeof one) == 0 &&
-        bind(fd.get(), reinterpret_cast<sockaddr*>(&sa), sizeof sa) == 0 && listen(fd.get(), 1024) == 0)
-        return fd;
-
-    std::perror(addr.c_str());
-    return {};
-}
-
-void on_signal(int)
-{
-    int saved = errno;
-    uint64_t one = 1;
-    ssize_t r = write(g_stop_fd, &one, sizeof one);
-    (void)r;
-    errno = saved;
-}
-
 }  // namespace
 
 int run_server(const Config& cfg)
 {
-    std::signal(SIGPIPE, SIG_IGN);
-    rlimit rl;
-    if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
-        rl.rlim_cur = rl.rlim_max;
-        setrlimit(RLIMIT_NOFILE, &rl);
-    }
+    raise_fd_limit();
 
     Shared shared{Fd(open(cfg.root.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC)), cfg.timeout};
     if (!shared.root) {
@@ -423,17 +337,16 @@ int run_server(const Config& cfg)
     }
     probe.reset();
 
-    Fd stop(eventfd(0, EFD_CLOEXEC));
+    Fd stop(install_stop_signals());
+    if (!stop) {
+        std::perror("eventfd");
+        return -1;
+    }
     g_stop_fd = stop.get();
-    struct sigaction sa{};
-    sa.sa_handler = on_signal;
-    sa.sa_flags = SA_RESTART;
-    sigaction(SIGINT, &sa, nullptr);
-    sigaction(SIGTERM, &sa, nullptr);
 
     std::vector<std::unique_ptr<Worker>> workers;
     for (int i = 0; i < cfg.workers; i++) {
-        Fd listener = listen_on(cfg.addr, cfg.port);
+        Fd listener(listen_on(cfg.addr.c_str(), cfg.port));
         if (!listener)
             return -1;
         workers.push_back(std::make_unique<Worker>(shared, std::move(listener)));

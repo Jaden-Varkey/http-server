@@ -1,0 +1,19 @@
+name: ci
+
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        compiler:
+          - { cc: gcc, cxx: g++ }
+          - { cc: clang, cxx: clang++ }
+        san: ["", "address,undefined", "thread"]
+    steps:
+      - uses: actions/checkout@v4
+      - name: Lower ASLR entropy (ThreadSanitizer needs it on new kernels)
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - run: make test CC=${{ matrix.compiler.cc }} CXX=${{ matrix.compiler.cxx }} SAN=${{ matrix.san }}
